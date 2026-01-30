@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { getCurrentUser } from "aws-amplify/auth";
 import { apiFetch } from "@/lib/api";
@@ -12,6 +12,10 @@ export default function JoinPage() {
 
   const [status, setStatus] = useState("Checking session...");
   const [me, setMe] = useState<string | null>(null);
+  const [checked, setChecked] = useState(false);
+
+  // evita doble accept por renders/retries
+  const didAccept = useRef(false);
 
   useEffect(() => {
     console.log("ENV CHECK", {
@@ -21,17 +25,48 @@ export default function JoinPage() {
     });
   }, []);
 
+  // 1) Check sesión una vez
   useEffect(() => {
     getCurrentUser()
       .then((u) => setMe(u.username))
-      .catch(() => setMe(null));
+      .catch(() => setMe(null))
+      .finally(() => setChecked(true));
   }, []);
 
+  // 2) Si no hay invite token, corta
   useEffect(() => {
-    // auto-accept si ya está logueado
-    if (me && inviteId) accept();
+    if (!checked) return;
+    if (!inviteId) {
+      setStatus("Missing invite token.");
+    }
+  }, [checked, inviteId]);
+
+  // 3) Si no está logueado -> redirige al login (home)
+  useEffect(() => {
+    if (!checked) return;
+    if (!inviteId) return;
+
+    if (!me) {
+      setStatus("Not signed in. Redirecting to sign in...");
+
+      const next = `/join?invite=${encodeURIComponent(inviteId)}`;
+      router.replace(
+        `/?next=${encodeURIComponent(next)}&invite=${encodeURIComponent(inviteId)}`
+      );
+    }
+  }, [checked, me, inviteId, router]);
+
+  // 4) Auto-accept si ya está logueado
+  useEffect(() => {
+    if (!checked) return;
+    if (!inviteId) return;
+    if (!me) return;
+    if (didAccept.current) return;
+
+    didAccept.current = true;
+    accept();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [me, inviteId]);
+  }, [checked, me, inviteId]);
 
   async function accept() {
     if (!inviteId) return setStatus("Missing invite token.");
@@ -49,12 +84,20 @@ export default function JoinPage() {
       setStatus("Invite accepted ✅ Redirecting...");
       router.push("/?joined=1");
     } catch (e: any) {
+      didAccept.current = false; // permite reintentar con el botón
       setStatus(`Accept error: ${e?.message || String(e)}`);
     }
   }
 
   return (
-    <main style={{ maxWidth: 720, margin: "60px auto", fontFamily: "system-ui", color: "white" }}>
+    <main
+      style={{
+        maxWidth: 720,
+        margin: "60px auto",
+        fontFamily: "system-ui",
+        color: "white",
+      }}
+    >
       <h1>Join Household</h1>
 
       <p style={{ opacity: 0.8 }}>
@@ -65,9 +108,18 @@ export default function JoinPage() {
         Status: <b>{status}</b>
       </p>
 
-      {!me ? (
+      {!checked ? (
+        <p style={{ opacity: 0.8 }}>Checking session...</p>
+      ) : !inviteId ? (
         <p style={{ opacity: 0.8 }}>
-          You must sign in first, then come back to this link.
+          This invite link is invalid. Ask the owner to send it again.
+        </p>
+      ) : !me ? (
+        <p style={{ opacity: 0.8 }}>
+          Redirecting you to sign in…
+          <br />
+          If this is not the right account, create a new one, then you’ll be
+          brought back here automatically.
         </p>
       ) : (
         <button

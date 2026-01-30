@@ -2,6 +2,7 @@
 
 import type React from "react";
 import { useEffect, useMemo, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   signUp,
   signIn,
@@ -45,6 +46,11 @@ type Tx = {
 };
 
 export default function Home() {
+  const router = useRouter();
+  const sp = useSearchParams();
+  const nextUrl = sp.get("next") || "";
+  const inviteFromUrl = sp.get("invite") || "";
+
   // -------- AUTH UI ----------
   const [email, setEmail] = useState("");
   const [pass, setPass] = useState("");
@@ -70,6 +76,16 @@ export default function Home() {
   // -------- INVITES ----------
   const [inviteRole, setInviteRole] = useState<"MEMBER" | "OWNER">("MEMBER");
   const [inviteLink, setInviteLink] = useState<string>("");
+
+  // ✅ guarda el inviteId creado para que el OWNER reciba el pop-up cuando acepten
+  const [watchInviteId, setWatchInviteId] = useState<string>("");
+
+  // ✅ toast / popup
+  const [toast, setToast] = useState<string>("");
+  function showToast(msg: string) {
+    setToast(msg);
+    window.setTimeout(() => setToast(""), 4500);
+  }
 
   // -------- TX CREATE ----------
   const [txs, setTxs] = useState<Tx[]>([]);
@@ -396,6 +412,53 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me, selectedHouseId]);
 
+  // ✅ Polling: cuando un invitado acepte, el OWNER recibe toast
+  useEffect(() => {
+    if (!me) return;
+
+    const saved = typeof window !== "undefined" ? localStorage.getItem("watchInviteId") : "";
+    const inviteId = watchInviteId || saved || "";
+    if (!inviteId) return;
+
+    let stopped = false;
+    let alreadyNotified = false;
+
+    const tick = async () => {
+      try {
+        const res = await apiFetch(`/invites/${inviteId}`, { method: "GET" });
+        const inv = res?.invite;
+        if (!inv) return;
+
+        if (inv.status === "ACCEPTED" && inv.acceptedBy && inv.acceptedBy !== me) {
+          if (!alreadyNotified) {
+            alreadyNotified = true;
+
+            const name =
+              (res?.acceptedProfile?.displayName || "").trim() ||
+              (res?.acceptedProfile?.userId || "").trim() ||
+              "Someone";
+
+            showToast(`✅ ${name} joined your household`);
+            localStorage.removeItem("watchInviteId");
+            setWatchInviteId("");
+          }
+        }
+      } catch {
+        // silencioso
+      }
+    };
+
+    tick();
+    const id = window.setInterval(() => {
+      if (!stopped) tick();
+    }, 5000);
+
+    return () => {
+      stopped = true;
+      window.clearInterval(id);
+    };
+  }, [me, watchInviteId]);
+
   // -------- AUTH ----------
   async function doSignUp() {
     setStatus("Signing up...");
@@ -446,6 +509,9 @@ export default function Home() {
       await refreshMeAndHouseholds();
       await loadProfile();
       setStatus("Signed in ✅");
+
+      // ✅ si venías por invitación (/?next=...), vuelve a /join
+      if (nextUrl) router.push(nextUrl);
     } catch (e: any) {
       const msg = e?.message || String(e);
 
@@ -453,6 +519,7 @@ export default function Home() {
         await refreshMeAndHouseholds().catch(() => {});
         await loadProfile().catch(() => {});
         setStatus("You were already signed in ✅");
+        if (nextUrl) router.push(nextUrl);
         return;
       }
 
@@ -535,6 +602,11 @@ export default function Home() {
 
       const url = `${window.location.origin}/join?invite=${encodeURIComponent(res.inviteId)}`;
       setInviteLink(url);
+
+      // ✅ importante: guarda invite para polling del pop-up
+      setWatchInviteId(res.inviteId);
+      localStorage.setItem("watchInviteId", res.inviteId);
+
       setStatus("Invite created ✅ Copy the link.");
     } catch (e: any) {
       setStatus(`Invite error: ${e?.message || String(e)}`);
@@ -733,6 +805,27 @@ export default function Home() {
         }
       `}</style>
 
+      {/* ✅ TOAST POP-UP */}
+      {toast ? (
+        <div
+          style={{
+            position: "fixed",
+            top: 18,
+            right: 18,
+            zIndex: 9999,
+            padding: "12px 14px",
+            borderRadius: 14,
+            border: "1px solid rgba(255,255,255,.18)",
+            background: "rgba(0,0,0,.55)",
+            color: "#fff",
+            backdropFilter: "blur(8px)",
+            boxShadow: "0 18px 50px rgba(0,0,0,.45)",
+          }}
+        >
+          {toast}
+        </div>
+      ) : null}
+
       <div style={shell}>
         {/* HEADER */}
         <div style={topBar}>
@@ -764,6 +857,26 @@ export default function Home() {
         <div style={statusBar}>
           <b>Status:</b> {status || "—"}
         </div>
+
+        {/* ✅ Banner si vienes de invitación */}
+        {!me && inviteFromUrl ? (
+          <div
+            style={{
+              marginTop: 12,
+              padding: "10px 12px",
+              borderRadius: 16,
+              border: "1px solid rgba(255,255,255,.12)",
+              background: "rgba(255,255,255,.06)",
+              fontSize: 13,
+            }}
+          >
+            <b>Invite link detected</b>
+            <div style={{ opacity: 0.85, marginTop: 6 }}>
+              You’re joining a household via invitation. If this is not the right account,
+              create a new user (Sign Up), then Sign In — you’ll be taken back automatically.
+            </div>
+          </div>
+        ) : null}
 
         {/* AUTH */}
         {!me ? (
@@ -860,7 +973,14 @@ export default function Home() {
 
                 {/* HOUSEHOLDS */}
                 <section style={card}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "baseline",
+                      gap: 10,
+                    }}
+                  >
                     <h2 style={{ margin: 0, fontSize: 16 }}>Households</h2>
                     <span style={{ opacity: 0.7, fontSize: 12 }}>
                       {selectedHouse ? `Role: ${selectedHouse.role}` : "—"}
@@ -934,7 +1054,14 @@ export default function Home() {
 
                 {/* INVITE */}
                 <section style={card}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "baseline",
+                      gap: 10,
+                    }}
+                  >
                     <h2 style={{ margin: 0, fontSize: 16 }}>Invite</h2>
                     <span style={{ opacity: 0.7, fontSize: 12 }}>
                       {selectedHouse ? `Role: ${selectedHouse.role}` : "—"}
@@ -992,9 +1119,7 @@ export default function Home() {
                           </div>
                         </div>
                       ) : (
-                        <p style={{ opacity: 0.75, margin: "10px 0 0" }}>
-                          Create a link and share it.
-                        </p>
+                        <p style={{ opacity: 0.75, margin: "10px 0 0" }}>Create a link and share it.</p>
                       )}
                     </>
                   )}
@@ -1004,7 +1129,14 @@ export default function Home() {
               {/* RIGHT */}
               <div style={{ display: "grid", gap: 14 }}>
                 <section style={card}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "baseline",
+                      gap: 10,
+                    }}
+                  >
                     <h2 style={{ margin: 0, fontSize: 16 }}>Quick add</h2>
                     <span style={{ opacity: 0.7, fontSize: 12 }}>
                       Auto refresh: <b>every 3s</b>
@@ -1071,9 +1203,7 @@ export default function Home() {
                     </div>
                     <div style={kpi}>
                       <div style={kpiLabel}>Net vs Goal</div>
-                      <div style={{ ...kpiValue, color: netColor }}>
-                        {totals.net.toFixed(2)}
-                      </div>
+                      <div style={{ ...kpiValue, color: netColor }}>{totals.net.toFixed(2)}</div>
                       <div style={{ opacity: 0.7, fontSize: 12, marginTop: 4 }}>
                         Goal: {(goal?.savingsGoal ?? 0).toFixed(2)}
                       </div>
@@ -1085,7 +1215,14 @@ export default function Home() {
 
             {/* TABLE FULL WIDTH */}
             <section style={card}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "baseline",
+                  gap: 10,
+                }}
+              >
                 <h2 style={{ margin: 0, fontSize: 16 }}>Transactions</h2>
                 <span style={{ opacity: 0.7, fontSize: 12 }}>{txs.length} items</span>
               </div>
