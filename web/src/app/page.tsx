@@ -1,7 +1,7 @@
 "use client";
 
 import type React from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   signUp,
@@ -10,6 +10,7 @@ import {
   getCurrentUser,
   confirmSignUp,
   resendSignUpCode,
+  fetchAuthSession,
 } from "aws-amplify/auth";
 import { apiFetch } from "@/lib/api";
 
@@ -39,25 +40,48 @@ type Tx = {
   date: string; // YYYY-MM-DD
   createdAt: string;
   createdBy?: string;
-
-  // NEW: guardado por Lambda al crear la tx
   createdByName?: string;
   createdByAvatar?: string;
+};
+
+type InvitePollResponse = {
+  invite?: {
+    inviteId: string;
+    houseId: string;
+    houseName?: string | null;
+    role: string;
+    status: "PENDING" | "ACCEPTED" | "EXPIRED" | string;
+    createdBy: string;
+    createdAt: string;
+    expiresAt?: string;
+    targetEmail?: string | null;
+    acceptedBy?: string | null;
+    acceptedAt?: string | null;
+  };
+  acceptedProfile?: {
+    userId: string;
+    displayName: string;
+    avatarUrl: string;
+  } | null;
 };
 
 export default function Home() {
   const router = useRouter();
   const sp = useSearchParams();
-  const nextUrl = sp.get("next") || "";
-  const inviteFromUrl = sp.get("invite") || "";
+  const nextUrl = (sp.get("next") || "").trim();
+  const inviteFromUrl = (sp.get("invite") || "").trim();
 
   // -------- AUTH UI ----------
+  const [authMode, setAuthMode] = useState<"signin" | "signup" | "confirm">("signin");
   const [email, setEmail] = useState("");
   const [pass, setPass] = useState("");
   const [code, setCode] = useState("");
   const [status, setStatus] = useState<string>("");
 
-  const [me, setMe] = useState<string | null>(null);
+  // ✅ meUsername: visible (email)
+  const [meUsername, setMeUsername] = useState<string | null>(null);
+  // ✅ meSub: ID real (sub) que usa Dynamo/Invites
+  const [meSub, setMeSub] = useState<string>("");
 
   // -------- HOUSEHOLDS ----------
   const [households, setHouseholds] = useState<Household[]>([]);
@@ -87,6 +111,9 @@ export default function Home() {
     window.setTimeout(() => setToast(""), 4500);
   }
 
+  // evita duplicar toast
+  const notifiedOnce = useRef(false);
+
   // -------- TX CREATE ----------
   const [txs, setTxs] = useState<Tx[]>([]);
   const [txType, setTxType] = useState<"INCOME" | "EXPENSE">("EXPENSE");
@@ -102,7 +129,7 @@ export default function Home() {
   });
 
   // -------- TX EDIT ----------
-  const [editingKey, setEditingKey] = useState<string>(""); // `${date}#${txId}`
+  const [editingKey, setEditingKey] = useState<string>("");
   const [editType, setEditType] = useState<"INCOME" | "EXPENSE">("EXPENSE");
   const [editAmount, setEditAmount] = useState<string>("");
   const [editCategory, setEditCategory] = useState<string>("");
@@ -210,6 +237,7 @@ export default function Home() {
     ...btn,
     background: "rgba(124,156,255,.18)",
     borderColor: "rgba(124,156,255,.35)",
+    fontWeight: 800,
   };
 
   const btnGhost: React.CSSProperties = {
@@ -223,6 +251,20 @@ export default function Home() {
     background: "rgba(255,255,255,.06)",
     borderColor: "rgba(255,255,255,.18)",
   };
+
+  const tabsWrap: React.CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+    gap: 8,
+  };
+
+  const tabBtn = (active: boolean): React.CSSProperties => ({
+    ...btn,
+    background: active ? "rgba(124,156,255,.18)" : "rgba(255,255,255,.04)",
+    borderColor: active ? "rgba(124,156,255,.35)" : "rgba(255,255,255,.10)",
+    fontWeight: active ? 900 : 700,
+    opacity: active ? 1 : 0.85,
+  });
 
   const kpisRow: React.CSSProperties = {
     display: "grid",
@@ -297,11 +339,6 @@ export default function Home() {
     [households, selectedHouseId]
   );
 
-  const goalValue = useMemo(() => {
-    const n = Number(goalInput);
-    return Number.isFinite(n) ? n : 0;
-  }, [goalInput]);
-
   const netColor = useMemo(() => {
     const g = goal?.savingsGoal ?? 0;
     return totals.net >= g ? "rgba(80, 220, 140, 1)" : "rgba(255, 120, 120, 1)";
@@ -310,7 +347,12 @@ export default function Home() {
   // -------- API ----------
   async function refreshMeAndHouseholds() {
     const user = await getCurrentUser();
-    setMe(user.username);
+    setMeUsername(user.username);
+
+    // ✅ sacar sub real (para comparar acceptedBy)
+    const session = await fetchAuthSession();
+    const sub = (session.tokens?.idToken?.payload?.sub as string) || "";
+    setMeSub(sub);
 
     const data = await apiFetch("/households");
     const list: Household[] = data.households || [];
@@ -394,15 +436,10 @@ export default function Home() {
 
   useEffect(() => {
     setInviteLink("");
-    if (!me || !selectedHouseId) return;
+    if (!meUsername || !selectedHouseId) return;
 
-    loadTransactions(selectedHouseId).catch((e) =>
-      setStatus(`Load tx error: ${e?.message || String(e)}`)
-    );
-
-    loadGoal(selectedHouseId).catch((e) =>
-      setStatus(`Load goal error: ${e?.message || String(e)}`)
-    );
+    loadTransactions(selectedHouseId).catch(() => {});
+    loadGoal(selectedHouseId).catch(() => {});
 
     const id = setInterval(() => {
       loadTransactions(selectedHouseId).catch(() => {});
@@ -410,37 +447,55 @@ export default function Home() {
 
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [me, selectedHouseId]);
+  }, [meUsername, selectedHouseId]);
+
+  // ✅ si vuelves al home con ?invite=... y eres OWNER, usa ese inviteId para polling también
+  useEffect(() => {
+    if (!meUsername) return;
+    if (!inviteFromUrl) return;
+
+    // lo guardamos, para que el OWNER pueda recibir toast incluso si refresca
+    try {
+      localStorage.setItem("watchInviteId", inviteFromUrl);
+      setWatchInviteId(inviteFromUrl);
+    } catch {}
+  }, [meUsername, inviteFromUrl]);
 
   // ✅ Polling: cuando un invitado acepte, el OWNER recibe toast
   useEffect(() => {
-    if (!me) return;
+    if (!meUsername) return;
 
     const saved = typeof window !== "undefined" ? localStorage.getItem("watchInviteId") : "";
-    const inviteId = watchInviteId || saved || "";
+    const inviteId = (watchInviteId || saved || "").trim();
     if (!inviteId) return;
 
     let stopped = false;
-    let alreadyNotified = false;
 
     const tick = async () => {
       try {
-        const res = await apiFetch(`/invites/${inviteId}`, { method: "GET" });
+        const res = (await apiFetch(`/invites/${inviteId}`, { method: "GET" })) as InvitePollResponse;
         const inv = res?.invite;
         if (!inv) return;
 
-        if (inv.status === "ACCEPTED" && inv.acceptedBy && inv.acceptedBy !== me) {
-          if (!alreadyNotified) {
-            alreadyNotified = true;
+        // si soy el creador del invite, es mi polling “dueño”
+        // si no lo soy, igual no pasa nada, el backend permite creador o aceptante.
+        if (inv.status === "ACCEPTED" && inv.acceptedBy) {
+          // ✅ comparación correcta: acceptedBy (sub) vs meSub (sub)
+          if (inv.acceptedBy !== meSub) {
+            if (!notifiedOnce.current) {
+              notifiedOnce.current = true;
 
-            const name =
-              (res?.acceptedProfile?.displayName || "").trim() ||
-              (res?.acceptedProfile?.userId || "").trim() ||
-              "Someone";
+              const name =
+                (res?.acceptedProfile?.displayName || "").trim() ||
+                (res?.acceptedProfile?.userId || "").trim() ||
+                "Someone";
 
-            showToast(`✅ ${name} joined your household`);
-            localStorage.removeItem("watchInviteId");
-            setWatchInviteId("");
+              const houseLabel = (inv.houseName || "").trim();
+              showToast(`✅ ${name} joined${houseLabel ? ` “${houseLabel}”` : " your household"}`);
+
+              localStorage.removeItem("watchInviteId");
+              setWatchInviteId("");
+            }
           }
         }
       } catch {
@@ -457,7 +512,7 @@ export default function Home() {
       stopped = true;
       window.clearInterval(id);
     };
-  }, [me, watchInviteId]);
+  }, [meUsername, meSub, watchInviteId]);
 
   // -------- AUTH ----------
   async function doSignUp() {
@@ -468,11 +523,12 @@ export default function Home() {
         password: pass,
         options: { userAttributes: { email } },
       });
-      setStatus("Signup OK. Put code and Confirm Code.");
+      setStatus("Signup OK. Check your email, then go to Confirm.");
+      setAuthMode("confirm");
     } catch (e: any) {
       const msg = e?.message || String(e);
       if (msg.toLowerCase().includes("user already exists")) {
-        setStatus("User already exists. Use Confirm Code (if needed) then Sign In.");
+        setStatus("User already exists. Use Confirm (if needed) then Sign In.");
       } else {
         setStatus(`Signup error: ${msg}`);
       }
@@ -486,6 +542,7 @@ export default function Home() {
     try {
       await confirmSignUp({ username: email, confirmationCode: code });
       setStatus("Email confirmed ✅ Now Sign In.");
+      setAuthMode("signin");
     } catch (e: any) {
       setStatus(`Confirm error: ${e?.message || String(e)}`);
     }
@@ -526,7 +583,8 @@ export default function Home() {
       if (msg.toLowerCase().includes("not authorized")) {
         setStatus("Signin error: wrong email/password (or user needs a reset).");
       } else if (msg.toLowerCase().includes("user is not confirmed")) {
-        setStatus("Signin error: user not confirmed. Use Confirm Code.");
+        setStatus("User not confirmed. Use Confirm tab.");
+        setAuthMode("confirm");
       } else {
         setStatus(`Signin error: ${msg}`);
       }
@@ -537,7 +595,8 @@ export default function Home() {
     setStatus("Signing out...");
     try {
       await signOut();
-      setMe(null);
+      setMeUsername(null);
+      setMeSub("");
       setHouseholds([]);
       setSelectedHouseId("");
       setTxs([]);
@@ -545,6 +604,7 @@ export default function Home() {
       setGoal(null);
       setProfile(null);
       setStatus("Signed out.");
+      notifiedOnce.current = false;
     } catch (e: any) {
       setStatus(`Signout error: ${e?.message || String(e)}`);
     }
@@ -554,7 +614,8 @@ export default function Home() {
     setStatus("Force signing out...");
     try {
       await signOut({ global: true });
-      setMe(null);
+      setMeUsername(null);
+      setMeSub("");
       setHouseholds([]);
       setSelectedHouseId("");
       setTxs([]);
@@ -562,6 +623,7 @@ export default function Home() {
       setGoal(null);
       setProfile(null);
       setStatus("Signed out (global). Now Sign In.");
+      notifiedOnce.current = false;
     } catch (e: any) {
       setStatus(`Force signout error: ${e?.message || String(e)}`);
     }
@@ -603,9 +665,10 @@ export default function Home() {
       const url = `${window.location.origin}/join?invite=${encodeURIComponent(res.inviteId)}`;
       setInviteLink(url);
 
-      // ✅ importante: guarda invite para polling del pop-up
+      // ✅ guarda invite para polling del pop-up
       setWatchInviteId(res.inviteId);
       localStorage.setItem("watchInviteId", res.inviteId);
+      notifiedOnce.current = false;
 
       setStatus("Invite created ✅ Copy the link.");
     } catch (e: any) {
@@ -764,6 +827,7 @@ export default function Home() {
       background: "rgba(255,255,255,.06)",
       overflow: "hidden",
       flex: "0 0 auto",
+      position: "relative",
     };
 
     if (url) {
@@ -783,7 +847,11 @@ export default function Home() {
       );
     }
 
-    return <span style={base} title={name}>{initials(name)}</span>;
+    return (
+      <span style={base} title={name}>
+        {initials(name)}
+      </span>
+    );
   }
 
   return (
@@ -820,6 +888,7 @@ export default function Home() {
             color: "#fff",
             backdropFilter: "blur(8px)",
             boxShadow: "0 18px 50px rgba(0,0,0,.45)",
+            maxWidth: 360,
           }}
         >
           {toast}
@@ -834,16 +903,12 @@ export default function Home() {
             <p style={brandSub}>Next.js + Cognito + API Gateway + Lambda + DynamoDB</p>
           </div>
 
-          {me ? (
+          {meUsername ? (
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
               <div style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-                <Avatar
-                  name={profile?.displayName || me}
-                  url={profile?.avatarUrl || ""}
-                  size={28}
-                />
+                <Avatar name={profile?.displayName || meUsername} url={profile?.avatarUrl || ""} size={28} />
                 <div style={{ opacity: 0.9, fontSize: 13 }}>
-                  Logged in as <b>{profile?.displayName || me}</b>
+                  Logged in as <b>{profile?.displayName || meUsername}</b>
                 </div>
               </div>
 
@@ -859,71 +924,118 @@ export default function Home() {
         </div>
 
         {/* ✅ Banner si vienes de invitación */}
-        {!me && inviteFromUrl ? (
+        {!meUsername && inviteFromUrl ? (
           <div
             style={{
               marginTop: 12,
               padding: "10px 12px",
               borderRadius: 16,
-              border: "1px solid rgba(255,255,255,.12)",
-              background: "rgba(255,255,255,.06)",
+              border: "1px solid rgba(124,156,255,.35)",
+              background: "rgba(124,156,255,.12)",
               fontSize: 13,
             }}
           >
             <b>Invite link detected</b>
-            <div style={{ opacity: 0.85, marginTop: 6 }}>
-              You’re joining a household via invitation. If this is not the right account,
-              create a new user (Sign Up), then Sign In — you’ll be taken back automatically.
+            <div style={{ opacity: 0.9, marginTop: 6 }}>
+              Sign in to join the household. If it’s the wrong account, sign up a new user and then sign in —
+              you’ll be sent back automatically.
             </div>
           </div>
         ) : null}
 
         {/* AUTH */}
-        {!me ? (
+        {!meUsername ? (
           <section style={{ ...card, marginTop: 14 }}>
-            <h2 style={{ marginTop: 0, fontSize: 16 }}>Login</h2>
+            <h2 style={{ marginTop: 0, fontSize: 16 }}>
+              {inviteFromUrl ? "Sign in to join" : "Welcome"}
+            </h2>
+
+            <div style={tabsWrap}>
+              <button type="button" style={tabBtn(authMode === "signin")} onClick={() => setAuthMode("signin")}>
+                Sign In
+              </button>
+              <button type="button" style={tabBtn(authMode === "signup")} onClick={() => setAuthMode("signup")}>
+                Sign Up
+              </button>
+              <button type="button" style={tabBtn(authMode === "confirm")} onClick={() => setAuthMode("confirm")}>
+                Confirm
+              </button>
+            </div>
+
+            <div style={{ height: 12 }} />
 
             <div style={{ display: "grid", gap: 10 }}>
-              <input
-                style={inputStyle}
-                placeholder="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-              />
-              <input
-                style={inputStyle}
-                placeholder="password"
-                type="password"
-                value={pass}
-                onChange={(e) => setPass(e.target.value)}
-              />
-              <input
-                style={inputStyle}
-                placeholder="verification code"
-                value={code}
-                onChange={(e) => setCode(e.target.value)}
-              />
-
-              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                <button type="button" style={btn} onClick={doConfirm}>
-                  Confirm Code
-                </button>
-                <button type="button" style={btn} onClick={doResend}>
-                  Resend Code
-                </button>
+              <div>
+                <div style={label}>Email</div>
+                <input
+                  style={inputStyle}
+                  placeholder="you@email.com"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                />
               </div>
 
+              {(authMode === "signin" || authMode === "signup") ? (
+                <div>
+                  <div style={label}>Password</div>
+                  <input
+                    style={inputStyle}
+                    placeholder="••••••••"
+                    type="password"
+                    value={pass}
+                    onChange={(e) => setPass(e.target.value)}
+                  />
+                </div>
+              ) : null}
+
+              {authMode === "confirm" ? (
+                <div>
+                  <div style={label}>Verification code</div>
+                  <input
+                    style={inputStyle}
+                    placeholder="123456"
+                    value={code}
+                    onChange={(e) => setCode(e.target.value)}
+                  />
+                </div>
+              ) : null}
+
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                <button type="button" style={btnPrimary} onClick={doSignIn}>
-                  Sign In
-                </button>
-                <button type="button" style={btn} onClick={doSignUp}>
-                  Sign Up
-                </button>
-                <button type="button" style={btnGhost} onClick={doForceSignOut}>
-                  Force Sign Out
-                </button>
+                {authMode === "signin" ? (
+                  <>
+                    <button type="button" style={btnPrimary} onClick={doSignIn}>
+                      Sign In
+                    </button>
+                    <button type="button" style={btnGhost} onClick={doForceSignOut}>
+                      Force Sign Out
+                    </button>
+                  </>
+                ) : authMode === "signup" ? (
+                  <>
+                    <button type="button" style={btnPrimary} onClick={doSignUp}>
+                      Create account
+                    </button>
+                    <button type="button" style={btn} onClick={() => setAuthMode("confirm")}>
+                      I already have a code
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button type="button" style={btnPrimary} onClick={doConfirm}>
+                      Confirm email
+                    </button>
+                    <button type="button" style={btn} onClick={doResend}>
+                      Resend code
+                    </button>
+                  </>
+                )}
               </div>
+
+              {inviteFromUrl ? (
+                <p style={{ opacity: 0.8, fontSize: 12, margin: "6px 0 0" }}>
+                  After you sign in, you’ll be redirected to accept the invite automatically.
+                </p>
+              ) : null}
             </div>
           </section>
         ) : (
@@ -973,14 +1085,7 @@ export default function Home() {
 
                 {/* HOUSEHOLDS */}
                 <section style={card}>
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "baseline",
-                      gap: 10,
-                    }}
-                  >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
                     <h2 style={{ margin: 0, fontSize: 16 }}>Households</h2>
                     <span style={{ opacity: 0.7, fontSize: 12 }}>
                       {selectedHouse ? `Role: ${selectedHouse.role}` : "—"}
@@ -1054,14 +1159,7 @@ export default function Home() {
 
                 {/* INVITE */}
                 <section style={card}>
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "baseline",
-                      gap: 10,
-                    }}
-                  >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
                     <h2 style={{ margin: 0, fontSize: 16 }}>Invite</h2>
                     <span style={{ opacity: 0.7, fontSize: 12 }}>
                       {selectedHouse ? `Role: ${selectedHouse.role}` : "—"}
@@ -1129,14 +1227,7 @@ export default function Home() {
               {/* RIGHT */}
               <div style={{ display: "grid", gap: 14 }}>
                 <section style={card}>
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "baseline",
-                      gap: 10,
-                    }}
-                  >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
                     <h2 style={{ margin: 0, fontSize: 16 }}>Quick add</h2>
                     <span style={{ opacity: 0.7, fontSize: 12 }}>
                       Auto refresh: <b>every 3s</b>
@@ -1147,11 +1238,7 @@ export default function Home() {
 
                   <div style={{ display: "grid", gap: 10 }}>
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-                      <select
-                        style={selectStyle}
-                        value={txType}
-                        onChange={(e) => setTxType(e.target.value as any)}
-                      >
+                      <select style={selectStyle} value={txType} onChange={(e) => setTxType(e.target.value as any)}>
                         <option value="EXPENSE">EXPENSE</option>
                         <option value="INCOME">INCOME</option>
                       </select>
@@ -1171,27 +1258,16 @@ export default function Home() {
                         value={txCategory}
                         onChange={(e) => setTxCategory(e.target.value)}
                       />
-                      <input
-                        style={inputStyle}
-                        type="date"
-                        value={txDate}
-                        onChange={(e) => setTxDate(e.target.value)}
-                      />
+                      <input style={inputStyle} type="date" value={txDate} onChange={(e) => setTxDate(e.target.value)} />
                     </div>
 
-                    <input
-                      style={inputStyle}
-                      placeholder="Note (optional)"
-                      value={txNote}
-                      onChange={(e) => setTxNote(e.target.value)}
-                    />
+                    <input style={inputStyle} placeholder="Note (optional)" value={txNote} onChange={(e) => setTxNote(e.target.value)} />
 
                     <button type="button" style={btnPrimary} onClick={createTransaction}>
                       Add transaction
                     </button>
                   </div>
 
-                  {/* KPIs */}
                   <div style={kpisRow}>
                     <div style={kpi}>
                       <div style={kpiLabel}>Income</div>
@@ -1213,16 +1289,9 @@ export default function Home() {
               </div>
             </div>
 
-            {/* TABLE FULL WIDTH */}
+            {/* TABLE */}
             <section style={card}>
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "baseline",
-                  gap: 10,
-                }}
-              >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
                 <h2 style={{ margin: 0, fontSize: 16 }}>Transactions</h2>
                 <span style={{ opacity: 0.7, fontSize: 12 }}>{txs.length} items</span>
               </div>
@@ -1255,9 +1324,7 @@ export default function Home() {
                             <td style={{ ...td, whiteSpace: "nowrap" }}>
                               <div style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
                                 <Avatar name={whoName} url={whoAvatar} size={28} />
-                                <span style={{ opacity: 0.9, fontSize: 13, fontWeight: 700 }}>
-                                  {whoName}
-                                </span>
+                                <span style={{ opacity: 0.9, fontSize: 13, fontWeight: 700 }}>{whoName}</span>
                               </div>
                             </td>
 
@@ -1265,11 +1332,7 @@ export default function Home() {
 
                             <td style={td}>
                               {isEditing ? (
-                                <select
-                                  style={{ ...selectStyle, padding: "8px 10px" }}
-                                  value={editType}
-                                  onChange={(e) => setEditType(e.target.value as any)}
-                                >
+                                <select style={{ ...selectStyle, padding: "8px 10px" }} value={editType} onChange={(e) => setEditType(e.target.value as any)}>
                                   <option value="EXPENSE">EXPENSE</option>
                                   <option value="INCOME">INCOME</option>
                                 </select>
@@ -1280,12 +1343,7 @@ export default function Home() {
 
                             <td style={{ ...td, width: 140 }}>
                               {isEditing ? (
-                                <input
-                                  style={{ ...inputStyle, padding: "8px 10px" }}
-                                  value={editAmount}
-                                  onChange={(e) => setEditAmount(e.target.value)}
-                                  placeholder="0.00"
-                                />
+                                <input style={{ ...inputStyle, padding: "8px 10px" }} value={editAmount} onChange={(e) => setEditAmount(e.target.value)} placeholder="0.00" />
                               ) : (
                                 <span>{t.amount.toFixed(2)}</span>
                               )}
@@ -1293,11 +1351,7 @@ export default function Home() {
 
                             <td style={{ ...td, minWidth: 160 }}>
                               {isEditing ? (
-                                <input
-                                  style={{ ...inputStyle, padding: "8px 10px" }}
-                                  value={editCategory}
-                                  onChange={(e) => setEditCategory(e.target.value)}
-                                />
+                                <input style={{ ...inputStyle, padding: "8px 10px" }} value={editCategory} onChange={(e) => setEditCategory(e.target.value)} />
                               ) : (
                                 <span>{t.category}</span>
                               )}
@@ -1305,12 +1359,7 @@ export default function Home() {
 
                             <td style={{ ...td, minWidth: 220 }}>
                               {isEditing ? (
-                                <input
-                                  style={{ ...inputStyle, padding: "8px 10px" }}
-                                  value={editNote}
-                                  onChange={(e) => setEditNote(e.target.value)}
-                                  placeholder="—"
-                                />
+                                <input style={{ ...inputStyle, padding: "8px 10px" }} value={editNote} onChange={(e) => setEditNote(e.target.value)} placeholder="—" />
                               ) : (
                                 <span style={{ opacity: t.note ? 1 : 0.65 }}>{t.note || "—"}</span>
                               )}
@@ -1319,35 +1368,19 @@ export default function Home() {
                             <td style={{ ...td, textAlign: "right", whiteSpace: "nowrap" }}>
                               {!isEditing ? (
                                 <div style={{ display: "inline-flex", gap: 8 }}>
-                                  <button
-                                    type="button"
-                                    style={{ ...btn, padding: "8px 10px" }}
-                                    onClick={() => startEdit(t)}
-                                  >
+                                  <button type="button" style={{ ...btn, padding: "8px 10px" }} onClick={() => startEdit(t)}>
                                     Edit
                                   </button>
-                                  <button
-                                    type="button"
-                                    style={{ ...btnDanger, padding: "8px 10px" }}
-                                    onClick={() => deleteTx(t)}
-                                  >
+                                  <button type="button" style={{ ...btnDanger, padding: "8px 10px" }} onClick={() => deleteTx(t)}>
                                     Delete
                                   </button>
                                 </div>
                               ) : (
                                 <div style={{ display: "inline-flex", gap: 8 }}>
-                                  <button
-                                    type="button"
-                                    style={{ ...btnPrimary, padding: "8px 10px" }}
-                                    onClick={() => saveEdit(t)}
-                                  >
+                                  <button type="button" style={{ ...btnPrimary, padding: "8px 10px" }} onClick={() => saveEdit(t)}>
                                     Save
                                   </button>
-                                  <button
-                                    type="button"
-                                    style={{ ...btnGhost, padding: "8px 10px" }}
-                                    onClick={cancelEdit}
-                                  >
+                                  <button type="button" style={{ ...btnGhost, padding: "8px 10px" }} onClick={cancelEdit}>
                                     Cancel
                                   </button>
                                 </div>

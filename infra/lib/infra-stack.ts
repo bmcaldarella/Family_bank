@@ -123,6 +123,15 @@ export class InfraStack extends cdk.Stack {
       authorizer: jwtAuthorizer,
     });
 
+    // ✅ NUEVO: polling del OWNER / invitador
+    // GET /invites/{inviteId}
+    httpApi.addRoutes({
+      path: "/invites/{inviteId}",
+      methods: [apigwv2.HttpMethod.GET],
+      integration,
+      authorizer: jwtAuthorizer,
+    });
+
     httpApi.addRoutes({
       path: "/profile",
       methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.PUT],
