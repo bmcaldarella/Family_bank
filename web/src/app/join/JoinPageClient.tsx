@@ -33,7 +33,7 @@ function humanError(msg: string) {
   return msg || "Something went wrong.";
 }
 
-export default function JoinPage() {
+export default function JoinPageClient() {
   const sp = useSearchParams();
   const router = useRouter();
   const inviteId = (sp.get("invite") || "").trim();
