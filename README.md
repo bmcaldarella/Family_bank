@@ -158,3 +158,8 @@ Built by **Brandon**
 ---
 
 > ⚠️ This project is for educational and portfolio purposes. Not intended for production banking use.
+
+
+IMPORTANT LOGIN TO TEST
+TEST LOGIN: testaws@yopmail.com
+Password:Qwerty123456@
